@@ -44,28 +44,33 @@ func (u *Uploader) Upload(ctx context.Context, limit int) error {
 	for u.opts.Iter.Next(wgctx) {
 		elem := u.opts.Iter.Value()
 
-		wg.Go(func() (rerr error) {
+		wg.Go(func() error {
 			u.opts.Progress.OnAdd(elem)
-			defer func() { u.opts.Progress.OnDone(elem, rerr) }()
 
-			if err := u.upload(wgctx, elem); err != nil {
-				// canceled by user, so we directly return error to stop all
-				if errors.Is(err, context.Canceled) {
-					return errors.Wrap(err, "upload")
-				}
+			err := u.upload(wgctx, elem)
+			// always report the real result, so a failed upload is never
+			// treated as done (e.g. by --rm)
+			u.opts.Progress.OnDone(elem, err)
 
-				// don't return error, just log it
+			// canceled by user, so we directly return error to stop all
+			if errors.Is(err, context.Canceled) {
+				return errors.Wrap(err, "upload")
 			}
 
+			// other errors are reported by OnDone and don't stop the rest
 			return nil
 		})
 	}
+
+	// wait for running uploads even when iteration stopped early, so their
+	// files are closed before the caller cleans up
+	werr := wg.Wait()
 
 	if err := u.opts.Iter.Err(); err != nil {
 		return errors.Wrap(err, "iter")
 	}
 
-	return wg.Wait()
+	return werr
 }
 
 func (u *Uploader) upload(ctx context.Context, elem Elem) error {
