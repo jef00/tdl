@@ -172,6 +172,12 @@ Delete the uploaded file after uploading successfully:
 tdl up -p /path/to/file --rm
 {{< /command >}}
 
+Also remove directories left empty under the given paths:
+
+{{< command >}}
+tdl up -p /path/to/dir --rm --prune
+{{< /command >}}
+
 ## Photo
 
 Upload images as photos instead of documents:

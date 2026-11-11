@@ -28,6 +28,9 @@ func NewUpload() *cobra.Command {
 				if opts.Chat != "" && opts.To != "" {
 					return errors.New("conflicting flags: --chat and --to cannot be set at the same time")
 				}
+				if opts.Prune && !opts.Remove {
+					return errors.New("error flags: --prune requires --rm")
+				}
 				return up.Run(logctx.Named(ctx, "up"), c, kvd, opts)
 			})
 		},
@@ -47,6 +50,7 @@ func NewUpload() *cobra.Command {
 	cmd.Flags().StringSliceVarP(&opts.Excludes, exclude, "e", []string{}, "exclude the specified file extensions")
 	cmd.Flags().BoolVar(&opts.Remove, "rm", false, "remove the uploaded files after uploading")
 	cmd.Flags().BoolVar(&opts.Photo, "photo", false, "upload the image as a photo instead of a file")
+	cmd.Flags().BoolVar(&opts.Prune, "prune", false, "with --rm, also remove directories left empty under the given paths")
 	cmd.Flags().StringVar(&opts.Caption, "caption", `"<code>"+FileName+"</code> - <code>"+MIME+"</code>"`, "caption for the uploaded media")
 
 	// completion and validation

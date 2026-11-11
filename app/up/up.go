@@ -41,6 +41,9 @@ type Options struct {
 	Remove   bool
 	Photo    bool
 	Caption  string
+
+	// Prune removes directories left empty under the input paths (requires Remove).
+	Prune bool
 }
 
 type Env struct {
@@ -104,9 +107,17 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 	up := uploader.New(options)
 
 	go upProgress.Render()
-	defer prog.Wait(ctx, upProgress)
 
-	return up.Upload(ctx, viper.GetInt(consts.FlagLimit))
+	err = up.Upload(ctx, viper.GetInt(consts.FlagLimit))
+	prog.Wait(ctx, upProgress)
+
+	if opts.Remove && opts.Prune {
+		for _, dir := range pruneEmptyDirs(opts.Paths) {
+			logctx.From(ctx).Info("pruned empty dir", zap.String("dir", dir))
+		}
+	}
+
+	return err
 }
 
 func resolveDest(ctx context.Context, manager *peers.Manager, input string) (*vm.Program, error) {
