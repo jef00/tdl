@@ -1,7 +1,7 @@
 package up
 
 import (
-	"os"
+	"io"
 	"path/filepath"
 
 	"github.com/gotd/td/telegram/message/entity"
@@ -9,6 +9,7 @@ import (
 	"github.com/gotd/td/tg"
 
 	"github.com/iyear/tdl/core/uploader"
+	"github.com/iyear/tdl/pkg/rar5"
 )
 
 type iterElem struct {
@@ -20,6 +21,8 @@ type iterElem struct {
 
 	asPhoto bool
 	remove  bool
+	vol     *rar5.Volume // set when file is a generated RAR volume
+	group   *splitGroup  // nil unless this is a volume of a split file
 }
 
 func (e *iterElem) File() uploader.File {
@@ -49,13 +52,16 @@ func (e *iterElem) AsPhoto() bool {
 	return e.asPhoto
 }
 
+// uploaderFile is a file on disk or a RAR volume generated on the fly.
 type uploaderFile struct {
-	*os.File
+	io.ReadSeeker
+	io.Closer
+	path string // real path, or the virtual path of a generated volume
 	size int64
 }
 
 func (u *uploaderFile) Name() string {
-	return filepath.Base(u.File.Name())
+	return filepath.Base(u.path)
 }
 
 func (u *uploaderFile) Size() int64 {

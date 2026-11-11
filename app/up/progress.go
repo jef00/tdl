@@ -3,6 +3,7 @@ package up
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/fatih/color"
@@ -55,18 +56,46 @@ func (p *progress) OnDone(elem uploader.Elem, err error) {
 	t := tracker.(*pw.Tracker)
 	e := elem.(*iterElem)
 
-	if err := p.closeFile(e); err != nil {
-		p.fail(t, elem, errors.Wrap(err, "close file"))
+	if cerr := p.closeFile(e); cerr != nil {
+		if e.group != nil {
+			e.group.done(cerr)
+		}
+		p.fail(t, elem, errors.Wrap(cerr, "close file"))
 		return
 	}
 
 	if err != nil {
+		if e.group != nil {
+			e.group.done(err)
+		}
 		p.fail(t, elem, errors.Wrap(err, "progress"))
 		return
 	}
 
+	path := e.file.path
+	if e.group != nil {
+		// A RAR volume only exists while it is uploaded. --keep-volumes
+		// saves a copy next to the source; if that fails the source must
+		// survive --rm, so the part counts as failed.
+		var kerr error
+		if e.vol != nil && e.group.keep {
+			_, kerr = e.vol.WriteFile(filepath.Dir(e.group.source))
+		}
+
+		// split file: act only after its last part succeeded
+		last := e.group.done(kerr)
+		if kerr != nil {
+			p.fail(t, elem, errors.Wrap(kerr, "keep volume"))
+			return
+		}
+		if !last {
+			return
+		}
+		path = e.group.source
+	}
+
 	if e.remove {
-		if err := os.Remove(e.file.File.Name()); err != nil {
+		if err := os.Remove(path); err != nil {
 			p.fail(t, elem, errors.Wrap(err, "remove file"))
 			return
 		}
@@ -93,7 +122,7 @@ func (p *progress) fail(t *pw.Tracker, elem uploader.Elem, err error) {
 }
 
 func (p *progress) tuple(elem uploader.Elem) tuple {
-	return tuple{elem.(*iterElem).file.File.Name(), elem.(*iterElem).to.ID()}
+	return tuple{elem.(*iterElem).file.path, elem.(*iterElem).to.ID()}
 }
 
 func (p *progress) processMessage(elem uploader.Elem) string {
@@ -102,5 +131,5 @@ func (p *progress) processMessage(elem uploader.Elem) string {
 
 func (p *progress) elemString(elem uploader.Elem) string {
 	e := elem.(*iterElem)
-	return fmt.Sprintf("%s -> %s(%d)", e.file.File.Name(), e.to.VisibleName(), e.to.ID())
+	return fmt.Sprintf("%s -> %s(%d)", e.file.path, e.to.VisibleName(), e.to.ID())
 }

@@ -178,6 +178,25 @@ Also remove directories left empty under the given paths:
 tdl up -p /path/to/dir --rm --prune
 {{< /command >}}
 
+## Split Large Files
+
+Upload files over Telegram's size limit as store-only RAR volumes (`movie.part1.rar`, `movie.part2.rar`, ...). tdl builds the volumes itself while uploading: each one is a small RAR header followed by a slice of the source file, streamed straight to Telegram. Nothing is written to disk, no extra free space is needed and no `rar` / WinRAR installation is required. The result is a regular RAR 5 volume set that WinRAR, `unrar` and 7-Zip extract and verify.
+
+Before a file is uploaded it is read once to compute the checksums RAR stores; files are handled one at a time, right before their upload. With `--rm`, the source is deleted only after every volume has been uploaded. An interrupted or failed run leaves nothing to clean up: run the same command again.
+
+`--keep-volumes` additionally saves each uploaded volume next to its source file.
+
+The default volume size is the account limit: 2000 MiB, or 4000 MiB with Premium. `--split-size` (MiB) makes volumes smaller and implies `--split`:
+
+{{< command >}}
+tdl up -p /path/to/dir --split
+tdl up -p /path/to/dir --split-size 3900 --rm --prune
+{{< /command >}}
+
+To restore a file, download all volumes into one folder and extract the first one; the rest are picked up automatically.
+
+Captions can use `Part` and `Parts`, e.g. `--caption 'FileName + (Parts > 0 ? " [" + string(Part) + "/" + string(Parts) + "]" : "")'`.
+
 ## Photo
 
 Upload images as photos instead of documents:

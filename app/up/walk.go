@@ -23,6 +23,9 @@ func walk(paths, includes, excludes []string) ([]*File, error) {
 				return err
 			}
 			if d.IsDir() {
+				if _, legacy := legacyStageDirs[d.Name()]; legacy { // volumes left by older builds
+					return filepath.SkipDir
+				}
 				return nil
 			}
 

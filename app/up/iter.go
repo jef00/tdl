@@ -17,12 +17,20 @@ import (
 	"github.com/iyear/tdl/core/uploader"
 	"github.com/iyear/tdl/core/util/mediautil"
 	"github.com/iyear/tdl/core/util/tutil"
+	"github.com/iyear/tdl/pkg/rar5"
 	"github.com/iyear/tdl/pkg/texpr"
 )
 
 type File struct {
 	File  string
 	Thumb string
+
+	// set for RAR volumes made by --split; File is then a virtual path
+	// next to the source, the volume itself only exists as vol
+	Part  int
+	Parts int
+	vol   *rar5.Volume
+	group *splitGroup // all volumes of one source file
 }
 
 type dest struct {
@@ -41,12 +49,16 @@ type iter struct {
 	delay   time.Duration
 	manager *peers.Manager
 
+	split   *splitter // nil unless --split
+	pending []*File   // volumes of the current split file not yet handed out
+	started bool
+
 	cur  int
 	err  error
 	file uploader.Elem
 }
 
-func newIter(files []*File, to, caption *vm.Program, chat string, topic int, photo, remove bool, delay time.Duration, manager *peers.Manager) *iter {
+func newIter(files []*File, to, caption *vm.Program, chat string, topic int, photo, remove bool, delay time.Duration, manager *peers.Manager, split *splitter) *iter {
 	return &iter{
 		files:   files,
 		to:      to,
@@ -57,6 +69,7 @@ func newIter(files []*File, to, caption *vm.Program, chat string, topic int, pho
 		remove:  remove,
 		delay:   delay,
 		manager: manager,
+		split:   split,
 
 		cur:  0,
 		err:  nil,
@@ -72,17 +85,21 @@ func (i *iter) Next(ctx context.Context) bool {
 	default:
 	}
 
-	if i.cur >= len(i.files) || i.err != nil {
+	if i.err != nil || (len(i.pending) == 0 && i.cur >= len(i.files)) {
 		return false
 	}
 
 	// if delay is set, sleep for a while for each iteration
-	if i.delay > 0 && i.cur > 0 { // skip first delay
+	if i.delay > 0 && i.started { // skip first delay
 		time.Sleep(i.delay)
 	}
+	i.started = true
 
-	cur := i.files[i.cur]
-	i.cur++
+	cur, err := i.advance(ctx)
+	if err != nil {
+		i.err = errors.Wrap(err, "split file")
+		return false
+	}
 
 	file, err := i.next(ctx, cur)
 	if err != nil {
@@ -94,8 +111,36 @@ func (i *iter) Next(ctx context.Context) bool {
 	return true
 }
 
+// advance returns the next file to upload. With --split, an oversize file is
+// turned into RAR volumes only when it is reached, and its volumes are handed
+// out one by one before the next file is looked at.
+func (i *iter) advance(ctx context.Context) (*File, error) {
+	if len(i.pending) > 0 {
+		f := i.pending[0]
+		i.pending = i.pending[1:]
+		return f, nil
+	}
+
+	f := i.files[i.cur]
+	i.cur++
+	if i.split == nil {
+		return f, nil
+	}
+
+	vols, err := i.split.pack(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	if len(vols) == 0 {
+		return f, nil
+	}
+
+	i.pending = vols[1:]
+	return vols[0], nil
+}
+
 func (i *iter) next(ctx context.Context, cur *File) (*iterElem, error) {
-	file, err := i.resolveFile(cur.File)
+	file, err := i.resolveFile(cur)
 	if err != nil {
 		return nil, errors.Wrap(err, "resolve file")
 	}
@@ -126,23 +171,41 @@ func (i *iter) next(ctx context.Context, cur *File) (*iterElem, error) {
 
 		asPhoto: i.photo,
 		remove:  i.remove,
+		vol:     cur.vol,
+		group:   cur.group,
 	}, nil
 }
 
-func (i *iter) resolveFile(path string) (*uploaderFile, error) {
-	f, err := os.Open(path)
+func (i *iter) resolveFile(cur *File) (*uploaderFile, error) {
+	if cur.vol != nil { // generated RAR volume, reads straight from the source
+		if err := cur.vol.Open(); err != nil {
+			return nil, errors.Wrap(err, "open volume")
+		}
+
+		return &uploaderFile{
+			ReadSeeker: cur.vol,
+			Closer:     cur.vol,
+			path:       cur.File,
+			size:       cur.vol.Size(),
+		}, nil
+	}
+
+	f, err := os.Open(cur.File)
 	if err != nil {
 		return nil, errors.Wrap(err, "open file")
 	}
 
 	stat, err := f.Stat()
 	if err != nil {
+		_ = f.Close()
 		return nil, errors.Wrap(err, "stat file")
 	}
 
 	return &uploaderFile{
-		File: f,
-		size: stat.Size(),
+		ReadSeeker: f,
+		Closer:     f,
+		path:       cur.File,
+		size:       stat.Size(),
 	}, nil
 }
 
@@ -243,8 +306,10 @@ func (i *iter) resolveThumb(path string) (*uploaderFile, error) {
 	}
 
 	return &uploaderFile{
-		File: thumb,
-		size: 0,
+		ReadSeeker: thumb,
+		Closer:     thumb,
+		path:       path,
+		size:       0,
 	}, nil
 }
 

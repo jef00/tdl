@@ -42,6 +42,12 @@ type Options struct {
 	Photo    bool
 	Caption  string
 
+	// Split uploads files larger than SplitSize as store-only RAR volumes.
+	Split bool
+	// SplitSize in bytes; 0 picks the account limit (2000 MiB, or 4000 MiB with Premium).
+	SplitSize int64
+	// KeepVolumes saves each uploaded RAR volume next to its source file.
+	KeepVolumes bool
 	// Prune removes directories left empty under the input paths (requires Remove).
 	Prune bool
 }
@@ -52,6 +58,8 @@ type Env struct {
 	FileExt   string `comment:"File extension"`
 	ThumbPath string `comment:"Thumbnail path"`
 	MIME      string `comment:"File mime type"`
+	Part      int    `comment:"RAR volume number of a split file (1-based), 0 if not split"`
+	Parts     int    `comment:"Total RAR volumes of a split file, 0 if not split"`
 }
 
 func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Options) (rerr error) {
@@ -72,8 +80,6 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		return err
 	}
 
-	color.Blue("Files count: %d", len(files))
-
 	pool := dcpool.NewPool(c,
 		int64(viper.GetInt(consts.FlagPoolSize)),
 		tclient.NewDefaultMiddlewares(ctx, viper.GetDuration(consts.FlagReconnectTimeout))...)
@@ -86,6 +92,21 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		return errors.Wrap(err, "get target peer")
 	}
 
+	var split *splitter
+	if opts.Split {
+		size, err := resolveSplitSize(ctx, manager, opts.SplitSize)
+		if err != nil {
+			return errors.Wrap(err, "resolve split size")
+		}
+		color.Blue("Split size: %s", utils.Byte.FormatBinaryBytes(size))
+
+		// Volumes are generated while uploading (see iter.advance), so there
+		// is nothing on disk to clean up, whether the run ends or is interrupted.
+		split = newSplitter(size, opts.KeepVolumes)
+	}
+
+	color.Blue("Files count: %d", len(files))
+
 	caption, err := resolveCaption(ctx, opts.Caption)
 	if err != nil {
 		return errors.Wrap(err, "get caption")
@@ -97,10 +118,14 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		prog.EnablePS(ctx, upProgress)
 	}
 
+	if split != nil {
+		split.log = func(msg string) { upProgress.Log(color.BlueString(msg)) }
+	}
+
 	options := uploader.Options{
 		Client:   pool.Default(ctx),
 		Threads:  viper.GetInt(consts.FlagThreads),
-		Iter:     newIter(files, to, caption, opts.Chat, opts.Thread, opts.Photo, opts.Remove, viper.GetDuration(consts.FlagDelay), manager),
+		Iter:     newIter(files, to, caption, opts.Chat, opts.Thread, opts.Photo, opts.Remove, viper.GetDuration(consts.FlagDelay), manager, split),
 		Progress: newProgress(upProgress),
 	}
 
@@ -118,6 +143,35 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 	}
 
 	return err
+}
+
+// detectMIME sniffs a file on disk, or a generated RAR volume through its reader.
+func detectMIME(file *File) (*mimetype.MIME, error) {
+	if file.vol == nil {
+		return mimetype.DetectFile(file.File)
+	}
+
+	vol := file.vol.Clone() // the original may already be open for upload
+	if err := vol.Open(); err != nil {
+		return nil, err
+	}
+	defer vol.Close()
+
+	return mimetype.DetectReader(vol)
+}
+
+func resolveSplitSize(ctx context.Context, manager *peers.Manager, size int64) (int64, error) {
+	limit := SplitLimitDefault
+
+	self, err := manager.Self(ctx)
+	if err != nil {
+		return 0, errors.Wrap(err, "get self")
+	}
+	if self.Raw().Premium {
+		limit = SplitLimitPremium
+	}
+
+	return alignSplitSize(size, limit), nil
 }
 
 func resolveDest(ctx context.Context, manager *peers.Manager, input string) (*vm.Program, error) {
@@ -167,7 +221,7 @@ func exprEnv(ctx context.Context, file *File) Env {
 
 	extension := filepath.Ext(file.File)
 	filename := strings.TrimSuffix(filepath.Base(file.File), extension)
-	mime, err := mimetype.DetectFile(file.File)
+	mime, err := detectMIME(file)
 	if err != nil {
 		mime = &mimetype.MIME{}
 		logctx.From(ctx).Error("detect file mime", zap.Error(err))
@@ -179,5 +233,7 @@ func exprEnv(ctx context.Context, file *File) Env {
 		FileExt:   extension,
 		ThumbPath: file.Thumb,
 		MIME:      mime.String(),
+		Part:      file.Part,
+		Parts:     file.Parts,
 	}
 }
