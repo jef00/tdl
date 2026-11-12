@@ -7,6 +7,7 @@ import (
 
 	"github.com/gabriel-vasile/mimetype"
 	"github.com/go-faster/errors"
+	"github.com/gotd/td/constant"
 	"github.com/gotd/td/telegram/message"
 	"github.com/gotd/td/telegram/message/entity"
 	"github.com/gotd/td/telegram/message/styling"
@@ -73,11 +74,42 @@ func (u *Uploader) Upload(ctx context.Context, limit int) error {
 	return werr
 }
 
+// upload uploads the file of elem and sends it as a message of its own.
 func (u *Uploader) upload(ctx context.Context, elem Elem) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
+	media, err := u.prepare(ctx, elem)
+	if err != nil {
+		return err
+	}
+
+	return u.send(ctx, elem, media)
+}
+
+func (u *Uploader) send(ctx context.Context, elem Elem, media message.MediaOption) error {
+	_, err := message.NewSender(u.opts.Client).
+		To(elem.To()).
+		Reply(elem.Thread()).
+		Media(ctx, media)
+	if err != nil {
+		return errors.Wrap(err, "send message")
+	}
+
+	return nil
+}
+
+// uploadFile uploads the content of the file of elem.
+func (u *Uploader) uploadFile(ctx context.Context, elem Elem) (tg.InputFileClass, error) {
+	file := elem.File()
+
+	if f, ok := file.(HeadLast); ok {
+		if file.Size() > constant.UploadMaxSmallSize {
+			return u.uploadHeadLast(ctx, elem, f)
+		}
+
+		// A small file is uploaded front to back like any other, at the
+		// price of reading it twice.
+		if err := f.WaitHead(ctx); err != nil {
+			return nil, errors.Wrap(err, "wait for first part")
+		}
 	}
 
 	up := uploader.NewUploader(u.opts.Client).
@@ -88,21 +120,13 @@ func (u *Uploader) upload(ctx context.Context, elem Elem) error {
 			process: u.opts.Progress,
 		})
 
-	f, err := up.Upload(ctx, uploader.NewUpload(elem.File().Name(), elem.File(), elem.File().Size()))
-	if err != nil {
-		return errors.Wrap(err, "upload file")
-	}
+	return up.Upload(ctx, uploader.NewUpload(file.Name(), file, file.Size()))
+}
 
-	if _, err = elem.File().Seek(0, io.SeekStart); err != nil {
-		return errors.Wrap(err, "seek file")
-	}
-	mime, err := mimetype.DetectReader(elem.File())
-	if err != nil {
-		return errors.Wrap(err, "detect mime")
-	}
-
-	// here convert underlying entities to formatters for message caption
-	caption := styling.Custom(func(eb *entity.Builder) error {
+// caption converts the underlying entities of the caption of elem to
+// formatters for a message caption.
+func caption(elem Elem) message.StyledTextOption {
+	return styling.Custom(func(eb *entity.Builder) error {
 		msg, entities := elem.Caption()
 		eb.Format(msg, lo.Map(entities, func(item tg.MessageEntityClass, _ int) entity.Formatter {
 			return func(_, _ int) tg.MessageEntityClass {
@@ -111,8 +135,30 @@ func (u *Uploader) upload(ctx context.Context, elem Elem) error {
 		})...)
 		return nil
 	})
+}
 
-	doc := message.UploadedDocument(f, caption).MIME(mime.String()).Filename(elem.File().Name())
+// prepare uploads the file of elem and returns the media to send it with.
+func (u *Uploader) prepare(ctx context.Context, elem Elem) (message.MediaOption, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	f, err := u.uploadFile(ctx, elem)
+	if err != nil {
+		return nil, errors.Wrap(err, "upload file")
+	}
+
+	if _, err = elem.File().Seek(0, io.SeekStart); err != nil {
+		return nil, errors.Wrap(err, "seek file")
+	}
+	mime, err := mimetype.DetectReader(elem.File())
+	if err != nil {
+		return nil, errors.Wrap(err, "detect mime")
+	}
+
+	doc := message.UploadedDocument(f, caption(elem)).MIME(mime.String()).Filename(elem.File().Name())
 	// upload thumbnail TODO(iyear): maybe still unavailable
 	if thumb, ok := elem.Thumb(); ok {
 		if thumbFile, err := uploader.NewUploader(u.opts.Client).
@@ -130,11 +176,11 @@ func (u *Uploader) upload(ctx context.Context, elem Elem) error {
 			break
 		}
 		// upload as photo
-		media = message.UploadedPhoto(f, caption)
+		media = message.UploadedPhoto(f, caption(elem))
 	case mediautil.IsVideo(mime.String()):
 		// reset reader
 		if _, err = elem.File().Seek(0, io.SeekStart); err != nil {
-			return errors.Wrap(err, "seek file")
+			return nil, errors.Wrap(err, "seek file")
 		}
 		if dur, w, h, err := mediautil.GetMP4Info(elem.File()); err == nil {
 			// #132. There may be some errors, but we can still upload the file
@@ -147,14 +193,5 @@ func (u *Uploader) upload(ctx context.Context, elem Elem) error {
 		media = doc.Audio().Title(fsutil.GetNameWithoutExt(elem.File().Name()))
 	}
 
-	_, err = message.NewSender(u.opts.Client).
-		WithUploader(up).
-		To(elem.To()).
-		Reply(elem.Thread()).
-		Media(ctx, media)
-	if err != nil {
-		return errors.Wrap(err, "send message")
-	}
-
-	return nil
+	return media, nil
 }
