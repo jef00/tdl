@@ -2,12 +2,14 @@ package up
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/gabriel-vasile/mimetype"
 )
 
 func TestAlignSplitSize(t *testing.T) {
@@ -73,11 +75,11 @@ func TestSplitterPack(t *testing.T) {
 
 	s := newSplitter(16384, false)
 
-	if vols, err := s.pack(context.Background(), &File{File: small}); err != nil || vols != nil {
+	if vols, err := s.pack(&File{File: small}); err != nil || vols != nil {
 		t.Fatalf("small file: got %v, %v; want it left alone", vols, err)
 	}
 
-	vols, err := s.pack(context.Background(), &File{File: big})
+	vols, err := s.pack(&File{File: big})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,11 +129,11 @@ func TestSplitterPackNameClash(t *testing.T) {
 	}
 
 	s := newSplitter(16384, false)
-	a, err := s.pack(context.Background(), &File{File: filepath.Join(dir, "Show.mkv")})
+	a, err := s.pack(&File{File: filepath.Join(dir, "Show.mkv")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := s.pack(context.Background(), &File{File: filepath.Join(dir, "show.mp4")})
+	b, err := s.pack(&File{File: filepath.Join(dir, "show.mp4")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,18 +143,6 @@ func TestSplitterPackNameClash(t *testing.T) {
 	}
 	if got := filepath.Base(b[0].File); got != "show.mp4.part1.rar" {
 		t.Errorf("clashing source: %s", got)
-	}
-}
-
-func TestSplitterPackCanceled(t *testing.T) {
-	dir := t.TempDir()
-	big := filepath.Join(dir, "movie.mkv")
-	writeFile(t, big, 40000)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, err := newSplitter(16384, false).pack(ctx, &File{File: big}); err != context.Canceled {
-		t.Fatalf("got %v, want context.Canceled", err)
 	}
 }
 
@@ -185,7 +175,7 @@ func TestIterPacksLazily(t *testing.T) {
 		filepath.Join(dir, "b.part3.rar"),
 	}
 	for n, w := range want {
-		f, err := it.advance(context.Background())
+		f, err := it.advance()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -223,5 +213,34 @@ func TestWalkSkipsLegacyStageDirs(t *testing.T) {
 	}
 	if len(files) != 1 || files[0].File != filepath.Join(dir, "season", "x.part1.rar") {
 		t.Fatalf("walk returned %d files, want only the one outside the legacy folders", len(files))
+	}
+}
+
+// The MIME type of a volume is taken from the RAR signature alone; it must be
+// what sniffing the finished volume gives.
+func TestDetectMIMEOfVolume(t *testing.T) {
+	dir := t.TempDir()
+	big := filepath.Join(dir, "movie.mkv")
+	writeFile(t, big, 40000)
+
+	vols, err := newSplitter(16384, false).pack(&File{File: big})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := detectMIME(vols[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err = vols[0].vol.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer vols[0].vol.Close()
+	want, err := mimetype.DetectReader(vols[0].vol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.String() != want.String() || !strings.Contains(got.String(), "rar") {
+		t.Errorf("detectMIME = %s, the volume itself is %s", got, want)
 	}
 }

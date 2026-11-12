@@ -1,6 +1,7 @@
 package up
 
 import (
+	"context"
 	"io"
 	"path/filepath"
 
@@ -26,6 +27,9 @@ type iterElem struct {
 }
 
 func (e *iterElem) File() uploader.File {
+	if e.vol != nil {
+		return volumeFile{uploaderFile: e.file, vol: e.vol}
+	}
 	return e.file
 }
 
@@ -66,4 +70,16 @@ func (u *uploaderFile) Name() string {
 
 func (u *uploaderFile) Size() int64 {
 	return u.size
+}
+
+// volumeFile is a generated RAR volume. Its header holds a checksum of the
+// data behind it, so it implements uploader.HeadLast: uploaded back to
+// front, the source is read only once.
+type volumeFile struct {
+	*uploaderFile
+	vol *rar5.Volume
+}
+
+func (v volumeFile) WaitHead(ctx context.Context) error {
+	return v.vol.WaitHead(ctx)
 }

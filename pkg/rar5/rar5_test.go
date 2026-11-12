@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -144,7 +143,7 @@ func TestSplit(t *testing.T) {
 	} {
 		t.Run(fmt.Sprintf("%d_%d", tc.size, tc.volSize), func(t *testing.T) {
 			path, content := writeSource(t, "Mövie [1].mkv", tc.size)
-			vols, err := Split(context.Background(), path, "Mövie [1]", int64(tc.volSize))
+			vols, err := Split(path, "Mövie [1]", int64(tc.volSize))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -214,7 +213,7 @@ func TestTailMatchesRar(t *testing.T) {
 
 func TestVolumeSeek(t *testing.T) {
 	path, _ := writeSource(t, "a.bin", 9000)
-	vols, err := Split(context.Background(), path, "a", 4096)
+	vols, err := Split(path, "a", 4096)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +224,7 @@ func TestVolumeSeek(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer v.Close()
-	for _, off := range []int64{0, 3, int64(len(v.head)) - 1, int64(len(v.head)) + 100, v.Size() - 5, v.Size()} {
+	for _, off := range []int64{0, 3, v.headLen - 1, v.headLen + 100, v.Size() - 5, v.Size()} {
 		if _, err = v.Seek(off, io.SeekStart); err != nil {
 			t.Fatal(err)
 		}
@@ -241,7 +240,7 @@ func TestVolumeSeek(t *testing.T) {
 
 func TestVolumeDetectsChangedSource(t *testing.T) {
 	path, _ := writeSource(t, "a.bin", 9000)
-	vols, err := Split(context.Background(), path, "a", 4096)
+	vols, err := Split(path, "a", 4096)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +255,7 @@ func TestVolumeDetectsChangedSource(t *testing.T) {
 
 func TestWriteFile(t *testing.T) {
 	path, _ := writeSource(t, "a.bin", 9000)
-	vols, err := Split(context.Background(), path, "a", 4096)
+	vols, err := Split(path, "a", 4096)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,18 +273,253 @@ func TestWriteFile(t *testing.T) {
 	}
 }
 
-func TestSplitCanceled(t *testing.T) {
-	path, _ := writeSource(t, "a.bin", 9000)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, err := Split(ctx, path, "a", 4096); !errors.Is(err, context.Canceled) {
-		t.Fatalf("got %v, want context.Canceled", err)
+func TestSplitVolumeTooSmall(t *testing.T) {
+	path, _ := writeSource(t, "a.bin", 100)
+	if _, err := Split(path, "a", 20); err == nil {
+		t.Fatal("expected an error for a volume smaller than its headers")
 	}
 }
 
-func TestSplitVolumeTooSmall(t *testing.T) {
-	path, _ := writeSource(t, "a.bin", 100)
-	if _, err := Split(context.Background(), path, "a", 20); err == nil {
-		t.Fatal("expected an error for a volume smaller than its headers")
+func TestCRC32Combine(t *testing.T) {
+	data := make([]byte, 70000)
+	rand.New(rand.NewSource(1)).Read(data)
+
+	for _, cut := range []int{0, 1, 2, 255, 256, 4096, 65535, 69999, 70000} {
+		a, b := data[:cut], data[cut:]
+		got := crc32Combine(crc32.ChecksumIEEE(a), crc32.ChecksumIEEE(b), int64(len(b)))
+		if want := crc32.ChecksumIEEE(data); got != want {
+			t.Errorf("cut at %d: got %08x, want %08x", cut, got, want)
+		}
+	}
+}
+
+// openAll opens every volume, like an upload that works on all of them.
+func openAll(t *testing.T, vols []*Volume) {
+	t.Helper()
+	for _, v := range vols {
+		if err := v.Open(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { v.Close() })
+	}
+}
+
+// readBody reads everything behind the first skip bytes of an open volume.
+func readBody(t *testing.T, v *Volume, skip int64) []byte {
+	t.Helper()
+	if _, err := v.Seek(skip, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+// readStart reads the first n bytes of an open volume.
+func readStart(t *testing.T, v *Volume, n int64) []byte {
+	t.Helper()
+	if _, err := v.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	start := make([]byte, n)
+	if _, err := io.ReadFull(v, start); err != nil {
+		t.Fatal(err)
+	}
+	return start
+}
+
+// Reading the data first and the start of the volume last must give the same
+// bytes as reading front to back, without reading any data twice: when the
+// start is read, every checksum is already known.
+func TestBodyFirstReadsOnce(t *testing.T) {
+	path, _ := writeSource(t, "a.bin", 30000)
+
+	ref, err := Split(path, "a", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := make([][]byte, len(ref))
+	for i, v := range ref {
+		want[i] = readVolume(t, v)
+	}
+
+	vols, err := Split(path, "a", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openAll(t, vols)
+
+	const skip = 512 // more than the header: some data is skipped as well
+	bodies := make([][]byte, len(vols))
+	for i, v := range vols {
+		bodies[i] = readBody(t, v, skip)
+	}
+	for i, p := range vols[0].src.parts {
+		if !p.done() {
+			t.Fatalf("part %d: checksum covers %d of %d bytes after its data was read", i, p.hashed, p.n)
+		}
+	}
+
+	for i, v := range vols {
+		if err = v.WaitHead(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		got := append(readStart(t, v, skip), bodies[i]...)
+		if !bytes.Equal(got, want[i]) {
+			t.Errorf("volume %d differs from the one read front to back", i)
+		}
+	}
+}
+
+// Volumes are uploaded concurrently; each must end up with the right bytes.
+func TestConcurrentVolumes(t *testing.T) {
+	path, content := writeSource(t, "a.bin", 200000)
+	vols, err := Split(path, "a", 16384)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openAll(t, vols)
+
+	raws := make([][]byte, len(vols))
+	errs := make(chan error, len(vols))
+	for i, v := range vols {
+		go func() {
+			if _, err := v.Seek(1000, io.SeekStart); err != nil {
+				errs <- err
+				return
+			}
+			body, err := io.ReadAll(v)
+			if err == nil {
+				err = v.WaitHead(context.Background())
+			}
+			if err != nil {
+				errs <- err
+				return
+			}
+			start := make([]byte, 1000)
+			_, _ = v.Seek(0, io.SeekStart)
+			_, err = io.ReadFull(v, start)
+			raws[i] = append(start, body...)
+			errs <- err
+		}()
+	}
+	for range vols {
+		if err = <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var joined []byte
+	for i, raw := range raws {
+		p := parse(t, raw)
+		want := crc32.ChecksumIEEE(p.data)
+		if i == len(raws)-1 {
+			want = crc32.ChecksumIEEE(content)
+		}
+		if p.sum != want {
+			t.Errorf("volume %d: crc %08x, want %08x", i, p.sum, want)
+		}
+		joined = append(joined, p.data...)
+	}
+	if !bytes.Equal(joined, content) {
+		t.Error("joined volume data differs from the source")
+	}
+}
+
+func TestWaitHead(t *testing.T) {
+	path, _ := writeSource(t, "a.bin", 9000)
+	split := func() []*Volume {
+		vols, err := Split(path, "a", 4096)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return vols
+	}
+	waitAsync := func(v *Volume) chan error {
+		done := make(chan error, 1)
+		go func() { done <- v.WaitHead(context.Background()) }()
+		return done
+	}
+	stillWaiting := func(done chan error) {
+		t.Helper()
+		select {
+		case err := <-done:
+			t.Fatalf("WaitHead returned early: %v", err)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	t.Run("only the last volume waits", func(t *testing.T) {
+		vols := split()
+		openAll(t, vols)
+		if err := vols[0].WaitHead(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("waits for open volumes", func(t *testing.T) {
+		vols := split()
+		openAll(t, vols)
+		done := waitAsync(vols[2])
+		stillWaiting(done)
+		readBody(t, vols[0], 0)
+		stillWaiting(done)
+		readBody(t, vols[1], vols[1].headLen)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("fails when a volume is given up", func(t *testing.T) {
+		vols := split()
+		openAll(t, vols)
+		done := waitAsync(vols[2])
+		readBody(t, vols[0], 0)
+		stillWaiting(done)
+		vols[1].Close()
+		if err := <-done; err == nil {
+			t.Fatal("WaitHead succeeded although volume 2 was never read")
+		}
+	})
+
+	t.Run("does not wait for volumes nobody reads", func(t *testing.T) {
+		vols := split()
+		if err := vols[2].WaitHead(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("stops when canceled", func(t *testing.T) {
+		vols := split()
+		openAll(t, vols)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := vols[2].WaitHead(ctx); err != context.Canceled {
+			t.Fatalf("got %v, want context.Canceled", err)
+		}
+	})
+}
+
+// A source that changes between reading its data and building the header
+// would get a checksum of data that is gone.
+func TestHeaderDetectsChangedSource(t *testing.T) {
+	path, _ := writeSource(t, "a.bin", 9000)
+	vols, err := Split(path, "a", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openAll(t, vols)
+	readBody(t, vols[0], vols[0].headLen)
+
+	if err = os.Chtimes(path, time.Now(), time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = vols[0].Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = vols[0].Read(make([]byte, 16)); err == nil {
+		t.Fatal("read a header for a source that changed")
 	}
 }

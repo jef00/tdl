@@ -95,7 +95,7 @@ func (i *iter) Next(ctx context.Context) bool {
 	}
 	i.started = true
 
-	cur, err := i.advance(ctx)
+	cur, err := i.advance()
 	if err != nil {
 		i.err = errors.Wrap(err, "split file")
 		return false
@@ -114,7 +114,7 @@ func (i *iter) Next(ctx context.Context) bool {
 // advance returns the next file to upload. With --split, an oversize file is
 // turned into RAR volumes only when it is reached, and its volumes are handed
 // out one by one before the next file is looked at.
-func (i *iter) advance(ctx context.Context) (*File, error) {
+func (i *iter) advance() (*File, error) {
 	if len(i.pending) > 0 {
 		f := i.pending[0]
 		i.pending = i.pending[1:]
@@ -127,7 +127,7 @@ func (i *iter) advance(ctx context.Context) (*File, error) {
 		return f, nil
 	}
 
-	vols, err := i.split.pack(ctx, f)
+	vols, err := i.split.pack(f)
 	if err != nil {
 		return nil, err
 	}
@@ -178,6 +178,8 @@ func (i *iter) next(ctx context.Context, cur *File) (*iterElem, error) {
 
 func (i *iter) resolveFile(cur *File) (*uploaderFile, error) {
 	if cur.vol != nil { // generated RAR volume, reads straight from the source
+		// opened here, before any of the volumes handed out earlier is done:
+		// the last volume counts on its predecessors being open or read
 		if err := cur.vol.Open(); err != nil {
 			return nil, errors.Wrap(err, "open volume")
 		}

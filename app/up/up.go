@@ -27,6 +27,7 @@ import (
 	"github.com/iyear/tdl/core/util/tutil"
 	"github.com/iyear/tdl/pkg/consts"
 	"github.com/iyear/tdl/pkg/prog"
+	"github.com/iyear/tdl/pkg/rar5"
 	"github.com/iyear/tdl/pkg/texpr"
 	"github.com/iyear/tdl/pkg/utils"
 )
@@ -145,19 +146,14 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 	return err
 }
 
-// detectMIME sniffs a file on disk, or a generated RAR volume through its reader.
+// detectMIME sniffs a file on disk. A generated RAR volume is known by its
+// signature: the rest of its header does not exist before its data is read.
 func detectMIME(file *File) (*mimetype.MIME, error) {
 	if file.vol == nil {
 		return mimetype.DetectFile(file.File)
 	}
 
-	vol := file.vol.Clone() // the original may already be open for upload
-	if err := vol.Open(); err != nil {
-		return nil, err
-	}
-	defer vol.Close()
-
-	return mimetype.DetectReader(vol)
+	return mimetype.Detect(rar5.Signature()), nil
 }
 
 func resolveSplitSize(ctx context.Context, manager *peers.Manager, size int64) (int64, error) {

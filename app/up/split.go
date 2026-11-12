@@ -1,7 +1,6 @@
 package up
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -61,7 +60,8 @@ var legacyStageDirs = map[string]struct{}{
 
 // splitter turns files larger than size into store-only RAR volumes of at
 // most size bytes. The volumes are generated while they are uploaded (see
-// pkg/rar5): nothing is written to disk and no rar binary is needed.
+// pkg/rar5): the source is read once, nothing is written to disk and no rar
+// binary is needed.
 type splitter struct {
 	size int64
 	keep bool         // --keep-volumes: save each uploaded volume next to its source
@@ -75,9 +75,9 @@ func newSplitter(size int64, keep bool) *splitter {
 }
 
 // pack returns the RAR volumes of f, or nil if f fits in a single upload and
-// should be sent as is. The file is read once for the checksums stored in
-// the volumes, which is why files are packed only when their turn comes.
-func (s *splitter) pack(ctx context.Context, f *File) ([]*File, error) {
+// should be sent as is. The volumes only fit the file as it is now, which is
+// why files are packed when their turn comes.
+func (s *splitter) pack(f *File) ([]*File, error) {
 	if s.size <= 0 {
 		return nil, nil
 	}
@@ -100,14 +100,11 @@ func (s *splitter) pack(ctx context.Context, f *File) ([]*File, error) {
 	}
 	s.used[s.key(dir, base)] = struct{}{}
 
-	s.logf("Splitting %s: reading it once for the RAR checksums", filepath.Base(f.File))
-	vols, err := rar5.Split(ctx, f.File, base, s.size)
+	vols, err := rar5.Split(f.File, base, s.size)
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
 		return nil, fmt.Errorf("split %s: %w", f.File, err)
 	}
+	s.logf("Splitting %s into %d RAR volumes", filepath.Base(f.File), len(vols))
 
 	g := &splitGroup{source: f.File, keep: s.keep}
 	g.remaining.Store(int32(len(vols)))

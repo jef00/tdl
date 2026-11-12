@@ -182,7 +182,9 @@ tdl up -p /path/to/dir --rm --prune
 
 Upload files over Telegram's size limit as store-only RAR volumes (`movie.part1.rar`, `movie.part2.rar`, ...). tdl builds the volumes itself while uploading: each one is a small RAR header followed by a slice of the source file, streamed straight to Telegram. Nothing is written to disk, no extra free space is needed and no `rar` / WinRAR installation is required. The result is a regular RAR 5 volume set that WinRAR, `unrar` and 7-Zip extract and verify.
 
-Before a file is uploaded it is read once to compute the checksums RAR stores; files are handled one at a time, right before their upload. With `--rm`, the source is deleted only after every volume has been uploaded. An interrupted or failed run leaves nothing to clean up: run the same command again.
+The upload starts right away and the source is read only once: the checksums RAR stores are computed from the data as it is uploaded, and the start of each volume, which holds them, is sent last. Files are handled one at a time, right before their upload.
+
+With `--rm`, the source is deleted only after every volume has been uploaded. An interrupted or failed run leaves nothing to clean up: run the same command again.
 
 `--keep-volumes` additionally saves each uploaded volume next to its source file.
 
