@@ -45,9 +45,20 @@ func (p *progress) OnUpload(elem uploader.Elem, state uploader.ProgressState) {
 
 	t := tracker.(*pw.Tracker)
 	t.UpdateTotal(state.Total)
-	t.SetValue(state.Uploaded)
+	// A tracker is done on its own once it reaches its total. Stop one byte
+	// short of that and let OnDone finish it, see there.
+	t.SetValue(max(min(state.Uploaded, state.Total-1), 0))
 }
 
+// OnDone finishes the tracker of elem, as done or as failed.
+//
+// The tracker is finished here and not when the last byte is uploaded, for
+// two reasons. A file is only done once it was sent, and a failure after the
+// upload must not read "done!". And the next file starts right after OnDone,
+// so the progress writer hardly ever renders without an active tracker: when
+// it does and a tracker is added before its next render, it erases the line
+// it printed last, which is the "done!" line of this file. With -l 1 that
+// used to happen all the time.
 func (p *progress) OnDone(elem uploader.Elem, err error) {
 	tracker, ok := p.trackers.Load(p.tuple(elem))
 	if !ok {
@@ -56,20 +67,32 @@ func (p *progress) OnDone(elem uploader.Elem, err error) {
 	t := tracker.(*pw.Tracker)
 	e := elem.(*iterElem)
 
+	if err = p.finish(e, err); err != nil {
+		p.fail(t, elem, err)
+		return
+	}
+
+	t.SetValue(e.file.Size())
+	if !t.IsDone() { // nothing was uploaded, like for an empty file
+		t.MarkAsDone()
+	}
+}
+
+// finish does what is left to do for elem after its upload ended with err:
+// close its files and, if it went well, keep the volume and remove the source.
+func (p *progress) finish(e *iterElem, err error) error {
 	if cerr := p.closeFile(e); cerr != nil {
 		if e.group != nil {
 			e.group.done(cerr)
 		}
-		p.fail(t, elem, errors.Wrap(cerr, "close file"))
-		return
+		return errors.Wrap(cerr, "close file")
 	}
 
 	if err != nil {
 		if e.group != nil {
 			e.group.done(err)
 		}
-		p.fail(t, elem, errors.Wrap(err, "progress"))
-		return
+		return errors.Wrap(err, "progress")
 	}
 
 	path := e.file.path
@@ -85,21 +108,21 @@ func (p *progress) OnDone(elem uploader.Elem, err error) {
 		// split file: act only after its last part succeeded
 		last := e.group.done(kerr)
 		if kerr != nil {
-			p.fail(t, elem, errors.Wrap(kerr, "keep volume"))
-			return
+			return errors.Wrap(kerr, "keep volume")
 		}
 		if !last {
-			return
+			return nil
 		}
 		path = e.group.source
 	}
 
 	if e.remove {
 		if err := os.Remove(path); err != nil {
-			p.fail(t, elem, errors.Wrap(err, "remove file"))
-			return
+			return errors.Wrap(err, "remove file")
 		}
 	}
+
+	return nil
 }
 
 func (p *progress) closeFile(e *iterElem) error {
