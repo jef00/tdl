@@ -31,9 +31,11 @@ type fakeTelegram struct {
 	parts map[int64]map[int][]byte // file id -> part -> data
 	order map[int64][]int          // file id -> parts in order of arrival
 
-	sent  []string          // file names of the messages sent, in order
-	docs  map[string][]byte // file name -> content
-	first map[string]int    // file name -> position at which part 0 arrived
+	sent   []string          // file names of the messages sent, in order
+	media  []string          // file names of the media made for albums, by id - 1
+	albums [][]string        // file names of each album sent
+	docs   map[string][]byte // file name -> content
+	first  map[string]int    // file name -> position at which part 0 arrived
 
 	fail func(req bin.Encoder) error
 }
@@ -68,38 +70,66 @@ func (f *fakeTelegram) Invoke(ctx context.Context, input bin.Encoder, output bin
 		f.savePart(req.FileID, req.FilePart, req.Bytes)
 		output.(*tg.BoolBox).Bool = &tg.BoolTrue{}
 	case *tg.MessagesSendMediaRequest:
-		media := req.Media.(*tg.InputMediaUploadedDocument)
-		var (
-			file  int64
-			parts int
-		)
-		switch in := media.File.(type) {
-		case *tg.InputFileBig:
-			file, parts = in.ID, in.Parts
-		case *tg.InputFile:
-			file, parts = in.ID, in.Parts
+		name, err := f.store(req.Media.(*tg.InputMediaUploadedDocument))
+		if err != nil {
+			return err
 		}
-		if len(f.parts[file]) != parts {
-			return fmt.Errorf("file has %d parts, %d were uploaded", parts, len(f.parts[file]))
-		}
-
-		var name string
-		for _, attr := range media.Attributes {
-			if n, ok := attr.(*tg.DocumentAttributeFilename); ok {
-				name = n.FileName
-			}
-		}
-		for part := range parts {
-			f.docs[name] = append(f.docs[name], f.parts[file][part]...)
-		}
-		f.first[name] = slices.Index(f.order[file], 0)
 		f.sent = append(f.sent, name)
+		output.(*tg.UpdatesBox).Updates = &tg.Updates{}
+	case *tg.MessagesUploadMediaRequest: // a file of an album
+		name, err := f.store(req.Media.(*tg.InputMediaUploadedDocument))
+		if err != nil {
+			return err
+		}
+		f.media = append(f.media, name)
+
+		media := &tg.MessageMediaDocument{}
+		media.SetDocument(&tg.Document{ID: int64(len(f.media))})
+		output.(*tg.MessageMediaBox).MessageMedia = media
+	case *tg.MessagesSendMultiMediaRequest:
+		var names []string
+		for _, m := range req.MultiMedia {
+			id := m.Media.(*tg.InputMediaDocument).ID.(*tg.InputDocument).ID
+			names = append(names, f.media[id-1])
+		}
+		f.sent = append(f.sent, names...)
+		f.albums = append(f.albums, names)
 		output.(*tg.UpdatesBox).Updates = &tg.Updates{}
 	default:
 		return fmt.Errorf("unexpected request %T", input)
 	}
 
 	return nil
+}
+
+// store keeps the content of an uploaded file under its name.
+func (f *fakeTelegram) store(media *tg.InputMediaUploadedDocument) (string, error) {
+	var (
+		file  int64
+		parts int
+	)
+	switch in := media.File.(type) {
+	case *tg.InputFileBig:
+		file, parts = in.ID, in.Parts
+	case *tg.InputFile:
+		file, parts = in.ID, in.Parts
+	}
+	if len(f.parts[file]) != parts {
+		return "", fmt.Errorf("file has %d parts, %d were uploaded", parts, len(f.parts[file]))
+	}
+
+	var name string
+	for _, attr := range media.Attributes {
+		if n, ok := attr.(*tg.DocumentAttributeFilename); ok {
+			name = n.FileName
+		}
+	}
+	for part := range parts {
+		f.docs[name] = append(f.docs[name], f.parts[file][part]...)
+	}
+	f.first[name] = slices.Index(f.order[file], 0)
+
+	return name, nil
 }
 
 func (f *fakeTelegram) savePart(file int64, part int, data []byte) {
@@ -191,6 +221,11 @@ func writeMovie(t *testing.T, dir string) (string, [][]byte) {
 
 func uploadSplit(t *testing.T, tgram *fakeTelegram, path string, keep bool, limit int) error {
 	t.Helper()
+	return uploadSplitAs(t, tgram, path, keep, limit, false)
+}
+
+func uploadSplitAs(t *testing.T, tgram *fakeTelegram, path string, keep bool, limit int, album bool) error {
+	t.Helper()
 	split := newSplitter(testVolume, keep)
 	split.log = func(string) {}
 
@@ -199,6 +234,7 @@ func uploadSplit(t *testing.T, tgram *fakeTelegram, path string, keep bool, limi
 		Threads:  threads,
 		Iter:     &splitIter{it: &iter{files: []*File{{File: path}}, split: split}, remove: true},
 		Progress: newProgress(pw.NewWriter()),
+		Album:    album,
 	})
 
 	done := make(chan error, 1)
@@ -244,6 +280,53 @@ func TestUploadSplitFile(t *testing.T) {
 
 			if names := dirNames(t, dir); len(names) != 0 {
 				t.Errorf("left %v, want the source removed and nothing else", names)
+			}
+		})
+	}
+}
+
+// --album: the volumes of a file share one message, and the source only goes
+// once that message was sent.
+func TestUploadSplitFileAlbum(t *testing.T) {
+	for _, limit := range []int{1, 2, 3} {
+		t.Run(fmt.Sprintf("limit %d", limit), func(t *testing.T) {
+			dir := t.TempDir()
+			path, want := writeMovie(t, dir)
+			tgram := newFakeTelegram()
+
+			var (
+				names   []string
+				removed bool // the source was gone before the album was sent
+			)
+			for i := range want {
+				names = append(names, fmt.Sprintf("movie.part%d.rar", i+1))
+			}
+			tgram.fail = func(req bin.Encoder) error {
+				if _, ok := req.(*tg.MessagesSendMultiMediaRequest); ok {
+					_, err := os.Stat(path)
+					removed = err != nil
+				}
+				return nil
+			}
+
+			if err := uploadSplitAs(t, tgram, path, false, limit, true); err != nil {
+				t.Fatal(err)
+			}
+
+			if len(tgram.albums) != 1 || !slices.Equal(tgram.albums[0], names) {
+				t.Fatalf("sent albums %v, want one of %v", tgram.albums, names)
+			}
+			for i, name := range names {
+				if !bytes.Equal(tgram.docs[name], want[i]) {
+					t.Errorf("%s arrived different from the volume read front to back", name)
+				}
+			}
+
+			if removed {
+				t.Error("the source was removed before its volumes were sent")
+			}
+			if left := dirNames(t, dir); len(left) != 0 {
+				t.Errorf("left %v, want the source removed and nothing else", left)
 			}
 		})
 	}

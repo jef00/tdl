@@ -60,6 +60,7 @@ func NewUpload() *cobra.Command {
 	cmd.Flags().StringSliceVarP(&opts.Excludes, exclude, "e", []string{}, "exclude the specified file extensions")
 	cmd.Flags().BoolVar(&opts.Remove, "rm", false, "remove the uploaded files after uploading")
 	cmd.Flags().BoolVar(&opts.Photo, "photo", false, "upload the image as a photo instead of a file")
+	cmd.Flags().BoolVar(&opts.Album, "album", false, "send files as albums: files in a row for the same destination share one message, up to 10 each")
 	cmd.Flags().BoolVar(&opts.Split, "split", false, "upload files over the size limit as store-only RAR volumes (name.part1.rar, ...), generated on the fly without temporary files")
 	cmd.Flags().Int64Var(&splitMiB, "split-size", 0, "volume size in MiB for --split, 0 means account limit (2000, or 4000 with Premium)")
 	cmd.Flags().BoolVar(&opts.KeepVolumes, "keep-volumes", false, "with --split, also save each uploaded RAR volume next to its source file")

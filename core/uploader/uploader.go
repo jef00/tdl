@@ -32,6 +32,9 @@ type Options struct {
 	Threads  int
 	Iter     Iter
 	Progress Progress
+	// Album sends files in a row for the same destination as albums of up
+	// to AlbumMax files, instead of one message per file.
+	Album bool
 }
 
 func New(o Options) *Uploader {
@@ -42,16 +45,29 @@ func (u *Uploader) Upload(ctx context.Context, limit int) error {
 	wg, wgctx := errgroup.WithContext(ctx)
 	wg.SetLimit(limit)
 
+	queue := &albums{u: u, ctx: wgctx}
+
 	for u.opts.Iter.Next(wgctx) {
 		elem := u.opts.Iter.Value()
+
+		var item *albumItem
+		if u.opts.Album {
+			item = queue.add(elem)
+		}
 
 		wg.Go(func() error {
 			u.opts.Progress.OnAdd(elem)
 
-			err := u.upload(wgctx, elem)
-			// always report the real result, so a failed upload is never
-			// treated as done (e.g. by --rm)
-			u.opts.Progress.OnDone(elem, err)
+			var err error
+			if item != nil {
+				// its album sends it and reports to OnDone
+				err = item.upload(wgctx, u)
+			} else {
+				err = u.upload(wgctx, elem)
+				// always report the real result, so a failed upload is never
+				// treated as done (e.g. by --rm)
+				u.opts.Progress.OnDone(elem, err)
+			}
 
 			// canceled by user, so we directly return error to stop all
 			if errors.Is(err, context.Canceled) {
@@ -63,9 +79,16 @@ func (u *Uploader) Upload(ctx context.Context, limit int) error {
 		})
 	}
 
+	// Albums first: they wait for their uploads themselves and still send
+	// with wgctx, which wg.Wait cancels.
+	aerr := queue.wait()
+
 	// wait for running uploads even when iteration stopped early, so their
 	// files are closed before the caller cleans up
 	werr := wg.Wait()
+	if werr == nil {
+		werr = aerr
+	}
 
 	if err := u.opts.Iter.Err(); err != nil {
 		return errors.Wrap(err, "iter")

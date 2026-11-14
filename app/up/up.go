@@ -42,6 +42,9 @@ type Options struct {
 	Remove   bool
 	Photo    bool
 	Caption  string
+	// Album sends files in a row for the same destination as one message,
+	// up to uploader.AlbumMax files each.
+	Album bool
 
 	// Split uploads files larger than SplitSize as store-only RAR volumes.
 	Split bool
@@ -128,6 +131,7 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		Threads:  viper.GetInt(consts.FlagThreads),
 		Iter:     newIter(files, to, caption, opts.Chat, opts.Thread, opts.Photo, opts.Remove, viper.GetDuration(consts.FlagDelay), manager, split),
 		Progress: newProgress(upProgress),
+		Album:    opts.Album,
 	}
 
 	up := uploader.New(options)

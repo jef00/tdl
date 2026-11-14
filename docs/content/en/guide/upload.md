@@ -199,6 +199,22 @@ To restore a file, download all volumes into one folder and extract the first on
 
 Captions can use `Part` and `Parts`, e.g. `--caption 'FileName + (Parts > 0 ? " [" + string(Part) + "/" + string(Parts) + "]" : "")'`.
 
+## Album
+
+Send files together instead of one message per file:
+
+{{< command >}}
+tdl up -p /path/to/dir --album
+{{< /command >}}
+
+Files that follow each other and go to the same chat (and topic) share one message, up to 10 per message, which is Telegram's limit; the next file starts a new album. The message is sent once all of its files are uploaded, and with `--rm` the files are only deleted after that. Albums arrive in the order of their files, whatever `-l` is: an album that is complete early waits for the one before it.
+
+Telegram only mixes photos with videos in an album. Audio files and other documents each need an album of their own kind, and GIFs and stickers can't be in an album at all, so tdl starts a new message whenever the kind of file changes. A file that fails to upload is left out and the rest of its album is still sent.
+
+Every file keeps its own caption. Telegram shows them all for documents and audio, but for an album of photos and videos only when exactly one of them has a caption.
+
+`--album` works with `--split` too: the RAR volumes of a large file are sent as albums like any other files.
+
 ## Photo
 
 Upload images as photos instead of documents:

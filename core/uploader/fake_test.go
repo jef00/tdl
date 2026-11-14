@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -19,6 +21,9 @@ type fakeTelegram struct {
 	order map[int64][]int          // file id -> parts in order of arrival
 	sent  int                      // messages sent
 
+	docs map[int64]string // documents made by messages.uploadMedia, by id -> file name
+	msgs [][]string       // file names of the messages sent from such documents
+
 	// fail, if set, can make a request fail
 	fail func(req bin.Encoder) error
 }
@@ -27,6 +32,7 @@ func newFakeTelegram() *fakeTelegram {
 	return &fakeTelegram{
 		parts: map[int64]map[int][]byte{},
 		order: map[int64][]int{},
+		docs:  map[int64]string{},
 	}
 }
 
@@ -51,6 +57,36 @@ func (f *fakeTelegram) Invoke(ctx context.Context, input bin.Encoder, output bin
 		f.savePart(req.FileID, req.FilePart, req.Bytes)
 		output.(*tg.BoolBox).Bool = &tg.BoolTrue{}
 	case *tg.MessagesSendMediaRequest:
+		if doc, ok := req.Media.(*tg.InputMediaDocument); ok {
+			f.msgs = append(f.msgs, []string{f.docName(doc)})
+		}
+		f.sent++
+		output.(*tg.UpdatesBox).Updates = &tg.Updates{}
+	case *tg.MessagesUploadMediaRequest:
+		in, ok := req.Media.(*tg.InputMediaUploadedDocument)
+		if !ok {
+			return fmt.Errorf("unexpected media %T", req.Media)
+		}
+
+		doc := &tg.Document{ID: int64(len(f.docs) + 1), Attributes: in.Attributes}
+		for _, attr := range in.Attributes {
+			if name, ok := attr.(*tg.DocumentAttributeFilename); ok {
+				f.docs[doc.ID] = name.FileName
+			}
+		}
+		// like Telegram, the fake has its own idea of what a file is
+		if strings.HasSuffix(f.docs[doc.ID], ".mp3") {
+			doc.Attributes = append(slices.Clone(doc.Attributes), &tg.DocumentAttributeAudio{})
+		}
+		media := &tg.MessageMediaDocument{}
+		media.SetDocument(doc)
+		output.(*tg.MessageMediaBox).MessageMedia = media
+	case *tg.MessagesSendMultiMediaRequest:
+		var names []string
+		for _, m := range req.MultiMedia {
+			names = append(names, f.docName(m.Media.(*tg.InputMediaDocument)))
+		}
+		f.msgs = append(f.msgs, names)
 		f.sent++
 		output.(*tg.UpdatesBox).Updates = &tg.Updates{}
 	default:
@@ -66,6 +102,10 @@ func (f *fakeTelegram) savePart(file int64, part int, data []byte) {
 	}
 	f.parts[file][part] = bytes.Clone(data)
 	f.order[file] = append(f.order[file], part)
+}
+
+func (f *fakeTelegram) docName(doc *tg.InputMediaDocument) string {
+	return f.docs[doc.ID.(*tg.InputDocument).ID]
 }
 
 // file puts the parts of an uploaded file together.
