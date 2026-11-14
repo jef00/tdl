@@ -3,10 +3,14 @@ name: fork build
 on:
   workflow_dispatch:
   push:
-    branches: [feat/upload-split-prune]
+    branches: [feat/upload-split-prune, feat/upload-album]
 
 permissions:
   contents: write # publish the rolling release
+
+env:
+  # every branch has a rolling release of its own
+  RELEASE: ${{ github.ref_name == 'feat/upload-album' && 'album' || 'split' }}
 
 jobs:
   windows:
@@ -26,23 +30,27 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           go build -trimpath \
-            -ldflags "-s -w -X github.com/iyear/tdl/pkg/consts.Version=split-${GITHUB_SHA::7}" \
+            -ldflags "-s -w -X github.com/iyear/tdl/pkg/consts.Version=${RELEASE}-${GITHUB_SHA::7}" \
             -o tdl.exe .
       - uses: actions/upload-artifact@v4
         with:
           name: tdl-windows-amd64
           path: tdl.exe
-      - name: Publish release "split-latest"
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          tag="${RELEASE}-latest"
           zip -j tdl_Windows_64bit.zip tdl.exe
           notes="Windows build of ${GITHUB_REF_NAME} @ ${GITHUB_SHA::7}: tdl up --split (RAR volumes streamed on the fly, no staging folder, no Rar.exe) / --split-size / --keep-volumes / --rm / --prune"
-          if gh release view split-latest >/dev/null 2>&1; then
-            git tag -f split-latest && git push -f origin split-latest
-            gh release edit split-latest --notes "$notes" --prerelease
-            gh release upload split-latest tdl.exe tdl_Windows_64bit.zip --clobber
+          if [ "$RELEASE" = album ]; then
+            notes="$notes / --album (files in a row share one message, up to 10 each)"
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            git tag -f "$tag" && git push -f origin "$tag"
+            gh release edit "$tag" --notes "$notes" --prerelease
+            gh release upload "$tag" tdl.exe tdl_Windows_64bit.zip --clobber
           else
-            gh release create split-latest tdl.exe tdl_Windows_64bit.zip \
-              --target "$GITHUB_SHA" --title "tdl split build" --notes "$notes" --prerelease
+            gh release create "$tag" tdl.exe tdl_Windows_64bit.zip \
+              --target "$GITHUB_SHA" --title "tdl ${RELEASE} build" --notes "$notes" --prerelease
           fi
